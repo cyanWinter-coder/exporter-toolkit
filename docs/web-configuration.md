@@ -132,12 +132,89 @@ basic_auth_users:
 
 
 # Rate limiting requests on the endpoint using a token bucket
+#
+# Requests are admitted through one shared token bucket refilled at
+# `interval`, whatever the number of clients. Requests that arrive while the
+# bucket is empty wait in a queue instead of failing immediately, and are then
+# served in the order they arrived. Queues are kept per authenticated user
+# when basic authentication is configured, and per client IP address
+# otherwise, so one noisy client cannot consume another client's turn.
 rate_limit:
-  interval: <duration> # time interval between two requests, set to 0 to disable rate limiter
-  burst: <int> # and permits a burst of <int> requests.
+  # Time between two tokens. Set to 0 (the default) to disable the limiter.
+  [ interval: <duration> | default = 0 ]
+  # Number of tokens the bucket can hold, i.e. how many requests may pass
+  # back-to-back before requests start queueing.
+  [ burst: <int> | default = 0 ]
+  # How long one request may wait for a token before it is answered with
+  # 429 Too Many Requests and a Retry-After header. Defaults to 5s.
+  # A negative duration disables queueing: requests that find the bucket empty
+  # are then rejected immediately, which is how earlier releases behaved.
+  [ max_wait: <duration> | default = 5s ]
+  # Maximum number of requests waiting per user or source address. Once a
+  # queue is full, further requests from that identity are rejected with
+  # 429 rather than growing the queue. 0 (the default) means no per-identity
+  # bound; the shared bucket still bounds overall throughput.
+  [ max_queued: <int> | default = 0 ]
+  # Extra request paths served without rate limiting. Health and readiness
+  # probes (/-/healthy, /-/ready, /healthz, /livez, /readyz and similar) are
+  # always exempt. A trailing "*" exempts every path with that prefix.
+  [ exempt_paths:
+    [ - <string> ... ] ]
 ```
 
 [A sample configuration file](web-config.yml) is provided.
+
+## Rate limiter behaviour
+
+When `rate_limit.interval` is set, every request consumes one token from a
+single shared bucket, and the bucket refills one token per `interval`. The
+bucket is shared by all clients and all listeners, so adding clients, opening
+new connections, or sending credentials does not raise the accepted request
+rate beyond `1/interval`.
+
+Requests that arrive while the bucket is empty are queued instead of being
+rejected straight away, which keeps a burst of parallel scrapes from turning
+into a retry storm. Requests are queued:
+
+* per user name, when the request carries basic auth credentials for a user
+  listed in `basic_auth_users`;
+* per client IP address otherwise, including requests without credentials and
+  requests naming an unknown user.
+
+Each queue is served in arrival order, and the limiter rotates between queues,
+so a busy client cannot starve the others. A queued request that cannot be
+served within `max_wait` is answered with `429 Too Many Requests` and a
+`Retry-After` header; a queue that already holds `max_queued` requests rejects
+new ones immediately with the same response. Setting `max_wait` to a negative
+duration restores the earlier behaviour of rejecting as soon as the bucket is
+empty.
+
+Canceling a scrape (because the client went away) removes it from its queue at
+once and does not consume a token. On server shutdown, all queued requests are
+released with `503 Service Unavailable` and a `Retry-After` header.
+
+Health and readiness probes are never queued: `/-/healthy`, `/-/ready`,
+`/-/health`, `/-/live`, `/healthz`, `/livez`, `/readyz`, `/health` and `/ready`
+are always served, plus any path listed in `exempt_paths`. A configured path
+ending in `*` exempts every path with that prefix, for example `/debug/*`.
+
+The limiter logs one line per decision with the queue identity (`user:<name>`
+or `ip:<address>`), the decision, the time spent waiting and the number of
+requests still waiting. Passwords and other credentials never appear in these
+lines or in any metric.
+
+When an exporter uses the toolkit's `bootstrap` package, the counters are also
+exposed as metrics:
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `exporter_web_rate_limit_requests_total` | counter | Requests by `decision` (`allowed`, `delayed`, `rejected`, `canceled`). |
+| `exporter_web_rate_limit_wait_seconds_total` | counter | Total time requests spent queued. |
+| `exporter_web_rate_limit_waiting_requests` | gauge | Requests currently queued. |
+| `exporter_web_rate_limit_identity_requests_total` | counter | Per-identity requests by `decision`. |
+| `exporter_web_rate_limit_identity_open` | gauge | 1 when an identity has requests queued. |
+
+Other callers can read the same counters with `web.ServerRateLimitStats`.
 
 ## About bcrypt
 

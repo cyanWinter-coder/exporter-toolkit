@@ -321,6 +321,9 @@ func (t *Runner) runWithArgs(args []string) error {
 	if err != nil {
 		return err
 	}
+	// The web rate limiter is built when the listeners are configured, so the
+	// collector reads the server lazily on each scrape.
+	t.Registry.MustRegister(newRateLimitCollector(func() *http.Server { return server }))
 	if t.provided.Name != "" {
 		t.Logger.Info("Starting "+t.provided.Name, "version", version.Info())
 		t.Logger.Info("Build context", "build_context", version.BuildContext())

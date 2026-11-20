@@ -34,7 +34,6 @@ import (
 	config_util "github.com/prometheus/common/config"
 	"go.yaml.in/yaml/v2"
 	"golang.org/x/sync/errgroup"
-	"golang.org/x/time/rate"
 )
 
 var (
@@ -155,9 +154,64 @@ type HTTPConfig struct {
 	Header map[string]string `yaml:"headers,omitempty"`
 }
 
+// RateLimiterConfig configures the scrape rate limiter. Interval and Burst
+// keep their original meaning: a shared token bucket refilled one token every
+// Interval, holding at most Burst tokens. Interval 0 disables the limiter.
+//
+// Existing configuration files keep working unchanged. A request that finds the
+// bucket empty now waits in a per-identity queue for up to MaxWait, which
+// defaults to defaultRateLimitWait, instead of being rejected immediately.
+// This keeps several Prometheus instances retrying the same endpoint from
+// turning one refusal into sustained congestion. Set MaxWait to a negative
+// duration to reject immediately, as earlier releases did.
 type RateLimiterConfig struct {
 	Burst    int           `yaml:"burst"`
 	Interval time.Duration `yaml:"interval"`
+	// MaxWait bounds how long one request may wait for a token. Zero selects
+	// defaultRateLimitWait, and a negative value rejects immediately without
+	// queueing.
+	MaxWait time.Duration `yaml:"max_wait"`
+	// MaxQueued bounds the number of requests waiting per identity. Zero means
+	// no per-identity bound; the shared bucket still bounds throughput.
+	MaxQueued int `yaml:"max_queued"`
+	// ExemptPaths lists request paths served without rate limiting, in
+	// addition to the health and readiness probes the toolkit always exempts.
+	ExemptPaths []string `yaml:"exempt_paths"`
+}
+
+// defaultRateLimitWait is how long a request may wait for a token when
+// max_wait is not configured.
+const defaultRateLimitWait = 5 * time.Second
+
+// withDefaults returns a copy of the configuration with unset fields resolved.
+// A negative MaxWait is preserved: it selects immediate rejection.
+func (c RateLimiterConfig) withDefaults() RateLimiterConfig {
+	if c.MaxWait == 0 {
+		c.MaxWait = defaultRateLimitWait
+	}
+	return c
+}
+
+// queueingEnabled reports whether requests may wait for a token.
+func (c RateLimiterConfig) queueingEnabled() bool {
+	return c.withDefaults().MaxWait > 0
+}
+
+// validate reports configuration values that cannot be honoured.
+func (c RateLimiterConfig) validate() error {
+	if c.Interval < 0 {
+		return errors.New("rate_limit.interval must not be negative")
+	}
+	if c.Burst < 0 {
+		return errors.New("rate_limit.burst must not be negative")
+	}
+	if c.MaxQueued < 0 {
+		return errors.New("rate_limit.max_queued must not be negative")
+	}
+	if c.MaxQueued > 0 && !c.queueingEnabled() {
+		return errors.New("rate_limit.max_queued requires queueing; set max_wait to a non-negative duration")
+	}
+	return nil
 }
 
 func getConfig(configPath string) (*Config, error) {
@@ -176,6 +230,9 @@ func getConfig(configPath string) (*Config, error) {
 	err = yaml.UnmarshalStrict(content, c)
 	if err == nil {
 		err = validateHeaderConfig(c.HTTPConfig.Header)
+	}
+	if err == nil {
+		err = c.RateLimiterConfig.validate()
 	}
 	c.TLSConfig.SetDirectory(filepath.Dir(configPath))
 	return c, err
@@ -434,10 +491,14 @@ func configureServer(server *http.Server, flags *FlagConfig, logger *slog.Logger
 		return nil, err
 	}
 
-	var limiter *rate.Limiter
-	if c.RateLimiterConfig.Interval != 0 {
-		limiter = rate.NewLimiter(rate.Every(c.RateLimiterConfig.Interval), c.RateLimiterConfig.Burst)
-		logger.Info("Rate Limiter is enabled.", "burst", c.RateLimiterConfig.Burst, "interval", c.RateLimiterConfig.Interval)
+	rateLimiter := NewRateLimiter(c.RateLimiterConfig.withDefaults(), logger)
+	if rateLimiter != nil {
+		logger.Info("Rate Limiter is enabled.",
+			"burst", c.RateLimiterConfig.Burst,
+			"interval", c.RateLimiterConfig.Interval,
+			"max_wait", c.RateLimiterConfig.withDefaults().MaxWait,
+			"max_queued", c.RateLimiterConfig.MaxQueued,
+		)
 	}
 
 	server.Handler = &webHandler{
@@ -445,7 +506,14 @@ func configureServer(server *http.Server, flags *FlagConfig, logger *slog.Logger
 		logger:        logger,
 		handler:       handler,
 		cache:         newCache(),
-		limiter:       limiter,
+		rateLimiter:   rateLimiter,
+	}
+	if rateLimiter != nil {
+		// Graceful shutdown must not leave scrapes queued: release them so
+		// they can be retried elsewhere instead of hanging until max_wait
+		// expires. Requests on connections closed without Shutdown observe
+		// their context cancellation instead.
+		server.RegisterOnShutdown(rateLimiter.Close)
 	}
 
 	config, err := ConfigToTLSConfig(&c.TLSConfig)

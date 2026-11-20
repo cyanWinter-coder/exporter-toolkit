@@ -11,7 +11,16 @@ basic_auth_users:
   alice: $2y$10$mDwo.lAisC94iLAyP81MCesa29IzH37oigHC/42V2pdJlUprsJPze
   bob: $2y$10$hLqFl9jSjoAAy95Z/zw8Ye8wkdMBM8c5Bn1ptYqP/AXyV0.oy0S8m
 
-# Rate limiting requests on the endpoint using a token bucket
+# Rate limiting requests on the endpoint using a shared token bucket.
+#
+# Requests that find the bucket empty wait in a per-user (or per-client-IP)
+# queue and are served in arrival order. Requests that cannot be served within
+# max_wait are answered with 429 Too Many Requests.
 rate_limit:
-  interval: "1s" # time interval between two requests, set to 0 to disable rate limiter
+  interval: "1s" # time between two tokens, set to 0 to disable rate limiter
   burst: 20 # and permits a burst of up to 20 requests.
+  # max_wait: 5s # how long a request may wait for a token; negative disables queueing.
+  # max_queued: 100 # maximum waiting requests per user or source address; 0 is unbounded.
+  # exempt_paths: # extra paths served without rate limiting, in addition to health probes. A trailing * matches a prefix.
+  #   - /debug/*
+
